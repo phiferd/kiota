@@ -218,3 +218,87 @@ Open:
 - GitHub runners (16 GB) die on mathlib past ~300k declarations without #24;
   artifact downloads hit the account's egress limit on 2026-10-19 (read numbers
   from job logs).
+
+### 2026-10-19 (evening) - The mathlib runaway was cache fragmentation; cslib accepted in full; proofs to disk
+
+The #314513 runaway was not reduction order. Two single-declaration experiments
+(full WHNF replaced by whnf_core before the structural comparison; no early
+proof-irrelevance inference in the core) died exactly like the baseline, and so
+did LAZY_DELTA_STEPS = 512 (run 39300825337). The cause is the cache keys: an
+open term's key names the binders it uses plus their types' transitive
+dependencies, but the occurrence bitset behind it is one word, so a term that
+mentions a binder past index 63 keyed on the whole telescope, and the WHNF
+caches keyed every open term on the whole telescope at any depth. Under 110
+binders 67% of key computations fell back (`CTXKEY calls=7,262,532
+fallbacks=4,838,949`, run 39307176721) and every binder pushed by a Pi/Lam
+congruence or an eta expansion made all cached work on the instance terms
+unreachable: whnf_core 4.8M entries for 125k distinct terms across 51k
+contexts, whnf 3.0M/86k, infer 2.4M/87.5k, defeq 883k/35.7k pairs; 9 GB,
+never finishing.
+
+PR #25 `fix/context-keys-past-64-binders` (2b54a70): exact occurrence lists for
+overflowed terms (sorted indices, one computation per node, `None` past 64
+entries so a 4000-binder perf test keys on the whole telescope as before), the
+same closure and binding-by-binding id over them, WHNF caches keyed like
+inference. Tests: a Prop-vs-Type dependency padded with 64 closed binders still
+cannot leak across contexts. Evidence (510a31f, the bitset version with the same
+keys; the list version 2b54a70 re-ran the single declaration, 11.8 s, and the
+small suite, see below):
+- #314513 alone: 12.8 s (run 39307336120) against never finishing.
+- init all 57,551 (184.0 s → 121.3 s), std all 100,225 (376.8 s → 267.1 s),
+  cslib ALL 379,950 accepted in 1619 s against the 1800 s limit (main timed out
+  at 1800 s with 379,531 started on a faster runner), zero failures everywhere, peak RSS unchanged
+  (runs 39308279309). Cross-runner; the std slow tail collapsed (Int64 div/mod
+  4-5 s each → under 0.7 s; DHashMap ofList_cons 3.4-3.8 s → under 0.7 s), which
+  runner variance does not do. Same-runner paired timing against main, two alternating rounds (run
+  39310825568): init 209.9/189.3 s → 141.3/163.3 s (−24%), std 466.7/429.2 s →
+  312.7/282.5 s (−34%); on the list version 2b54a70 (run 39312829800): init
+  183.6/189.1 s → 135.0/132.8 s (−28%), std 377.7/390.1 s → 260.4/259.3 s (−32%).
+- Mathlib from #314514 on (run 39308451072): declarations 314,514 to 622,201 in
+  about 2980 s of checking, 10.9 GB resident at 622k without the proof store,
+  three declines on huge literals (Real.log_three_near_10, Real.log_five_near_10:
+  the 256-bit byte cap; Batteries Char.isLower_toUpper_eq_false._proof_1_3: the
+  2^29 countdown budget), no reject, then a second runaway in the same file at
+  #622201 (Scheme.exists_π_app_comp_eq_of_locallyOfFinitePresentation_…).
+- Mathlib from #622202 to the end on keys + proof store (run 39318533070, the
+  harness releasing skipped declarations' proofs and resetting the interner as
+  the real run does): all 73,036 remaining declarations in about 600 s, peak
+  7.2 GB, two declines on the same 256-bit literal cap (Real.pi_gt_d20,
+  Real.pi_lt_d20), no reject.
+- Mathlib from the start on the fix (run 39308279309, keep-going, 14.5 GB cap):
+  443,820 declarations in 5680 s (main: 302k at 4200 s, then the runaway), no
+  reject, the same three literal declines, 9.1 GB resident at 442k without the
+  proof store. Whole-corpus estimate on a GitHub runner: 3900 + 2980 + 600 ≈
+  7500 s, about 4400 s on the arena machine: inside the test's 5680 s, outside
+  kiota.yaml's 3600 s cap.
+- The first list-free version crashed perf/app-lam and perf/shift-cascade under
+  the small-suite gate's 8 GiB cap (a memo keyed on node and depth is quadratic
+  on a 4000-deep lambda nest); the list version with the 64-entry cap is what
+  the PR carries. Gate on 2b54a70: default mode fails only the known pair-n21 cap crash, reclaim only
+  magma-list-deep-n36, nbe the same seven perf tests, all exactly as on #24.
+
+PR #26 `fix/proof-store` (d2f67a2, stacked on #25): released theorem proofs go to an
+unlinked temp file (post-order DAG, shared nodes once, hash verified on reload)
+and come back on demand in `unfold_delta`; a damaged blob is an error, never a
+term; a write failure keeps proofs in memory. 140 unit + 88 export tests.
+Evidence on the previous base (run 39309536393): init/std zero failures both
+sides, peak RSS init 2410 → 2272 MiB, std 2624 → 2405 MiB; cslib all 379,950 accepted in 1287 s at 3.5 GB peak against 1414 s at 4.95 GB
+for the keys fix alone (the reload path works end to end). Mathlib from the
+start (run 39309536393, keep-going, 14.5 GB cap): about 436k declarations in
+5680 s, one decline (the Batteries countdown), no reject, 4.1 GB resident at
+310k, 4.9 GB at 436k, 6.3 GB peak, against 9.1 GB at 442k and 9.9 GB peak
+without the store.
+
+Open:
+- Landing #25 and the proof store needs Sankalp's go; then the pin PR
+  (rev → new main, `timeout: 3600 → 5680`, drop `declines: cslib`) is his and
+  nomeata's call.
+- #622201 is the next runaway (diagnosis `remote/diag-622201`); the two Real.log
+  declines are fixed on `fix/huge-literal-peel` (69c545c: one peel of a literal
+  over 256 bits is allowed, a countdown of it declines after 16 consecutive
+  peels; both declarations accept in a windowed run, 4.3 GB resident at 443k
+  with the proof store); the Batteries countdown decline needs its own trace. cedar
+  `pe_duration_toMinutes` and con-leche `defeqLoop_shift` are to be re-measured
+  on the keys fix.
+- Kaggle gate22/gate24 kernels stall on #314513 (no keys fix) until their
+  20000 s limits; deleting them is Sankalp's call.
