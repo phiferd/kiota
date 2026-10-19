@@ -382,6 +382,111 @@ thread_local! {
         RefCell::new(FxHashMap::default());
     static INST1_MEMO: RefCell<FxHashMap<(usize, usize), Expr>> =
         RefCell::new(FxHashMap::default());
+    /// Node → sorted list of its loose bvar indices (see `used_bvar_set`),
+    /// `None` once a list would pass `USED_SET_CAP` entries.
+    static USED_SET_MEMO: RefCell<FxHashMap<usize, Option<Rc<[u32]>>>> =
+        RefCell::new(FxHashMap::default());
+}
+
+/// Most entries an occurrence list may have. A term that mentions more
+/// binders than this keys on the whole telescope, as every overflowed term
+/// did before; the list is for the common deep-context term that mentions
+/// a few binders far out.
+pub const USED_SET_CAP: usize = 64;
+
+/// The loose bvar indices of `e`, sorted ascending, for a term whose
+/// one-word `used_bvars` summary overflowed. The summary cannot tell *which*
+/// indices a term under 64 or more binders uses, and a context key that
+/// falls back to the whole telescope then differs for every binder pushed,
+/// so nothing computed about the term is ever found again.
+///
+/// `None` when `e` mentions more than `USED_SET_CAP` binders. Computed once
+/// per node from its children's lists (a binder shifts the body's indices
+/// down by one and drops index 0), memoized for the current declaration
+/// (`clear_subst_memos`). Keying the memo on the node alone is what keeps
+/// a nest of thousands of binders linear; a memo keyed on the node and the
+/// depth it is seen at is quadratic there.
+pub fn used_bvar_set(e: &Expr) -> Option<Rc<[u32]>> {
+    if e.used_bvars != USED_OVERFLOW {
+        return Some(Rc::from(bits_to_list(e.used_bvars, 0)));
+    }
+    let id = identity(e);
+    if let Some(r) = USED_SET_MEMO.with(|m| m.borrow().get(&id).cloned()) {
+        return r;
+    }
+    let r: Option<Rc<[u32]>> = (|| {
+        let mut acc: Vec<u32> = Vec::new();
+        match &e.data {
+            ExprData::BVar(i) => acc.push(*i),
+            ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => {}
+            ExprData::App(f, a) => {
+                merge_used(&mut acc, &child_used(f, 0)?)?;
+                merge_used(&mut acc, &child_used(a, 0)?)?;
+            }
+            ExprData::Lam(_, ty, body) | ExprData::Pi(_, ty, body) => {
+                merge_used(&mut acc, &child_used(ty, 0)?)?;
+                merge_used(&mut acc, &child_used(body, 1)?)?;
+            }
+            ExprData::Let(ty, val, body) => {
+                merge_used(&mut acc, &child_used(ty, 0)?)?;
+                merge_used(&mut acc, &child_used(val, 0)?)?;
+                merge_used(&mut acc, &child_used(body, 1)?)?;
+            }
+            ExprData::Proj(_, _, v) => merge_used(&mut acc, &child_used(v, 0)?)?,
+        }
+        Some(Rc::from(acc))
+    })();
+    USED_SET_MEMO.with(|m| m.borrow_mut().insert(id, r.clone()));
+    r
+}
+
+/// The indices of `c` at or above `drop`, re-based to `drop`.
+fn child_used(c: &Expr, drop: u32) -> Option<Vec<u32>> {
+    if c.loose <= drop {
+        return Some(Vec::new());
+    }
+    if c.used_bvars != USED_OVERFLOW {
+        // `loose <= 64` with `loose > drop` keeps the shift in range.
+        return Some(bits_to_list(c.used_bvars >> drop, 0));
+    }
+    let set = used_bvar_set(c)?;
+    Some(set.iter().filter(|&&i| i >= drop).map(|&i| i - drop).collect())
+}
+
+/// Sorted union into `acc`; `None` once the result passes the cap.
+fn merge_used(acc: &mut Vec<u32>, other: &[u32]) -> Option<()> {
+    if other.is_empty() {
+        return Some(());
+    }
+    let mut merged = Vec::with_capacity(acc.len() + other.len());
+    let (mut i, mut j) = (0, 0);
+    while i < acc.len() || j < other.len() {
+        let next = match (acc.get(i), other.get(j)) {
+            (Some(a), Some(b)) if a < b => { i += 1; *a }
+            (Some(a), Some(b)) if a > b => { j += 1; *b }
+            (Some(a), Some(_)) => { i += 1; j += 1; *a }
+            (Some(a), None) => { i += 1; *a }
+            (None, Some(b)) => { j += 1; *b }
+            (None, None) => unreachable!(),
+        };
+        merged.push(next);
+        if merged.len() > USED_SET_CAP {
+            return None;
+        }
+    }
+    *acc = merged;
+    Some(())
+}
+
+/// The set bits of a one-word summary as indices, each plus `base`.
+pub fn bits_to_list(mut bits: u64, base: u32) -> Vec<u32> {
+    let mut out = Vec::with_capacity(bits.count_ones() as usize);
+    while bits != 0 {
+        let i = bits.trailing_zeros();
+        out.push(i + base);
+        bits &= bits - 1;
+    }
+    out
 }
 
 pub fn intern(d: ExprData) -> Expr {
@@ -468,6 +573,7 @@ pub fn clear_subst_memos() {
     LEVEL_SUBST_IDS.with(|m| m.borrow_mut().clear());
     SHIFT_MEMO.with(|m| m.borrow_mut().clear());
     INST1_MEMO.with(|m| m.borrow_mut().clear());
+    USED_SET_MEMO.with(|m| m.borrow_mut().clear());
 }
 
 pub fn bvar(i: u32) -> Expr {
@@ -856,6 +962,45 @@ mod tests {
 
     fn s0() -> Expr {
         sort(level::zero())
+    }
+
+    /// `used_bvars` is a one-word summary; past index 63 it only says
+    /// "overflowed". `used_bvar_set` lists the indices, under binders too,
+    /// until a term mentions more binders than `USED_SET_CAP`.
+    #[test]
+    fn used_bvar_set_lists_indices_past_64_binders_up_to_the_cap() {
+        let list = |e: &Expr| used_bvar_set(e).map(|s| s.to_vec());
+        let e = app(app(bvar(130), bvar(64)), bvar(0));
+        assert_eq!(used_bvars(&e), u64::MAX, "the summary overflowed");
+        assert_eq!(list(&e), Some(vec![0, 64, 130]));
+        // One binder shifts every index down and drops the bound one.
+        let under = lam(BinderInfo::Default, bvar(70), e.clone());
+        assert_eq!(list(&under), Some(vec![63, 70, 129]));
+        // A closed body under a binder contributes nothing; the domain does.
+        let dom_only = pi(BinderInfo::Default, bvar(65), s0());
+        assert_eq!(list(&dom_only), Some(vec![65]));
+        // Mixed: an exact (small) child and an overflowed child.
+        let mixed = let_(bvar(3), bvar(0), app(bvar(1), bvar(99)));
+        assert_eq!(list(&mixed), Some(vec![0, 3, 98]));
+        assert_eq!(loose_bvar_range(&mixed), 99);
+        // Memoized per node: the same answer on a second call.
+        assert_eq!(list(&e), Some(vec![0, 64, 130]));
+        // A one-word term still answers, as a list.
+        assert_eq!(list(&app(bvar(5), bvar(2))), Some(vec![2, 5]));
+        // Past the cap the list is `None`, and so is every term built on it.
+        let mut dense = bvar(64);
+        for i in 65..(65 + USED_SET_CAP as u32) {
+            dense = app(dense, bvar(i));
+        }
+        assert_eq!(used_bvar_set(&dense), None, "65 indices");
+        assert_eq!(used_bvar_set(&app(dense.clone(), bvar(0))), None);
+        assert_eq!(used_bvar_set(&lam(BinderInfo::Default, s0(), dense)), None);
+        // Exactly the cap is still a list.
+        let mut full = bvar(64);
+        for i in 65..(64 + USED_SET_CAP as u32) {
+            full = app(full, bvar(i));
+        }
+        assert_eq!(used_bvar_set(&full).map(|s| s.len()), Some(USED_SET_CAP));
     }
 
     #[test]
