@@ -174,3 +174,47 @@ Open:
 - GitHub Actions throttled this account for long stretches (02:15-03:30Z and from
   ~10:00Z, 1-3 concurrent jobs); Kaggle CPU kernels with public inputs covered the
   gates.
+
+### 2026-10-19 - Board rebuilt (27 checkers, 234 tests); interpreters removed, Lean lazy-delta step, structure-eta types, export-node release
+
+Board readback (run of 2026-10-15, arena 315f24d4, 27 checkers, 234 tests): kiota
+is 22/27, key (0, 1, inf, 9), still on pin 2d2a9fa. On this board main pinned
+scores (0, 0, inf, 9) = 16th, and removing every non-mathlib decline leaves it
+16th; only mathlib acceptance moves it (15T instructions = 14th, 10T = 10th,
+6T = 8th, 4T = 5th). The 11 new tests change nothing for kiota.
+
+Landed by fast-forward, each with regression tests that fail on the previous
+code, chain main = 779e804 (01f05ae → 7bde9a7 #21 → 0dbc0d8 #22 → 633283d #24 → 779e804 #23, 2026-10-19 18:40Z):
+- #21: the name-matched Int, Lean.Omega, Int.Linear, Lean.Grind.CommRing and Rat
+  interpreters are gone (only Init.Prelude names are arena-guaranteed; five
+  tests show false Ok(true) on main). decide/ite/dite keep their shortcuts for
+  the exact Prelude constants. Same-run speedup normalized by sub-10 ms
+  declarations: init 3.75x, std 7.36x, cslib 3.29x.
+- #22: lazy delta takes Lean's step (unfold, then whnf_core). The four omega
+  declines left by #21 disappear: init all 57,551 in 153s, std all 100,225 in
+  405s, navier-stokes-euler all 124,850 in 1589s, cslib 346,637 of 379,950 at
+  1800s (accepted in 1309s on a faster runner), all with zero failures in
+  keep-going mode.
+- #24: the parser releases export nodes after their last reference (a first
+  pass over the file computes last references; released slots read as errors)
+  and the proofs of theorems no expression mentions. Retained memory on mathlib
+  is 6.95 GB at 300k declarations against 6.85 GB at 302k without it: almost every mathlib theorem is mentioned by a later expression, so nearly every proof is kept (a lower bound with every large proof released measured 4.3 GB; swapping referenced proofs to disk is the next step). A size-based proof cut
+  was rejected because kiota's delta path unfolds large theorem proofs for real
+  (8 cslib and 11 mathlib declines).
+- #23: Lean's type comparison before structure eta (PUnit.unit.{1} converted to
+  PUnit.unit.{2} on main).
+
+Open:
+- Runaway declarations: mathlib #314513
+  (AlgebraicGeometry.Scheme.exists_hom_hom_comp_eq_comp_of_isAffine_of_locallyOfFiniteType:
+  Spec.map (𝟙 R) vs 𝟙 (Spec R); the main path fully normalizes instance
+  structures while comparing proof-field types for proof irrelevance), cedar
+  Cedar.Thm.pe_duration_toMinutes, con-leche ConLeche.defeqLoop_shift. Lean
+  compares fields on partially unfolded terms; the fix is a Lean-style main
+  path (whnf_core, exhaustive lazy delta with structural comparison at each
+  step, full whnf last).
+- Mathlib on the arena needs the 3600s timeout in kiota.yaml raised to the
+  test's 5680s and the runaway fixed; both are Sankalp's calls (pin PR).
+- GitHub runners (16 GB) die on mathlib past ~300k declarations without #24;
+  artifact downloads hit the account's egress limit on 2026-10-19 (read numbers
+  from job logs).
